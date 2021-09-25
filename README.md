@@ -9,9 +9,11 @@ Refer to `go.mod`
 
 ## Build
 
+in Linux
+
 ```bash
-go build -o voyagemaster main.go  // Build
-./voyagemaster                    // Run
+make                // Build
+./voyagemaster      // Run
 ```
 
 ## Setting
@@ -32,4 +34,4 @@ leave = "{user}が{channel}から退出しました！"
 
 ## LICENSE
 
-[MIT LICENSE](LICENSE)
+[MIT](LICENSE)

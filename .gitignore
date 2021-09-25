@@ -1,1 +1,5 @@
 config.toml
+voyagemaster
+VoyageMaster.exe
+*.zip
+pub-*
