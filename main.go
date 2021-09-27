@@ -1,7 +1,9 @@
 package main
 
 import (
+	"io"
 	"log"
+	"os"
 	"strings"
 	"time"
 
@@ -10,10 +12,13 @@ import (
 )
 
 type Config struct {
-	Token      string         `toml:"token"`
-	Targets    []Target       `toml:"targets"`
-	DeleteTime int64          `toml:"deletetime"`
-	Template   NotifyTemplate `toml:"templates"`
+	Name       string   `toml:"name"`
+	Token      string   `toml:"token"`
+	Targets    []Target `toml:"targets"`
+	DeleteTime int64    `toml:"deletetime"`
+	Join       string   `toml:"join"`
+	Move       string   `toml:"move"`
+	Leave      string   `toml:"leave"`
 }
 
 type Target struct {
@@ -21,30 +26,56 @@ type Target struct {
 	TextChannel string `toml:"sendto"`
 }
 
-type NotifyTemplate struct {
-	Join  string `toml:"join"`
-	Move  string `toml:"move"`
-	Leave string `toml:"leave"`
-}
-
 type ReserveDelete struct {
+	Session   *discordgo.Session
 	ChannelId string
 	MessageId string
 	LimitUnix int64
 }
 
 var (
-	cfg     Config
+	cfgDic  map[string]Config
 	waitDel []ReserveDelete
 	stopper = make(chan bool)
+	power   = make(chan bool)
 )
 
 func main() {
-	cfg = getConfig()
+	cfgDic = map[string]Config{}
+	logfile, err := os.OpenFile("./voyagemaster.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
+	if err != nil {
+		log.Fatal("Can't open logfile:", err.Error())
+	}
+	defer logfile.Close()
+
+	log.SetOutput(io.MultiWriter(logfile, os.Stdout))
+	log.SetFlags(log.Ldate | log.Ltime)
+
+	log.Printf("============> VoyageMaster sail out!: %v\n", os.Args)
+
+	if len(os.Args) > 1 {
+		if os.Args[1] == "setting" {
+			// setting tool
+		} else {
+			log.Printf("Unknown arguments: %v\n", os.Args[1:])
+		}
+		return
+	}
+	cfgs := getConfig()
+	for _, cfg := range cfgs {
+		go cfg.watch()
+		cfgDic["Bot "+cfg.Token] = cfg
+	}
+	go deleteLine(power)
+
+	<-stopper
+}
+
+func (cfg Config) watch() {
 	disc, err := discordgo.New()
 	disc.Token = "Bot " + cfg.Token
 	if err != nil {
-		log.Fatal("Can't login", err)
+		log.Fatalf("[%s]Can't login: %s\n", cfg.Name, err.Error())
 	}
 
 	disc.AddHandler(onVoiceStateUpdate)
@@ -54,22 +85,22 @@ func main() {
 	}
 	defer disc.Close()
 
-	power := make(chan bool)
-	go deleteLine(power, disc)
-
-	log.Println("Starting bot is successfully.")
-	<-stopper
+	log.Printf("[%s]Starting bot is successfully.", cfg.Name)
+	<-power
 }
 
-func getConfig() (cfg Config) {
-	_, err := toml.DecodeFile("config.toml", &cfg)
+func getConfig() []Config {
+	var cfgs struct {
+		Bot []Config `toml:"bot"`
+	}
+	_, err := toml.DecodeFile("config.toml", &cfgs)
 	if err != nil {
 		log.Fatal(err)
 	}
-	return cfg
+	return cfgs.Bot
 }
 
-func deleteLine(power chan bool, s *discordgo.Session) {
+func deleteLine(power chan bool) {
 	waitDel = make([]ReserveDelete, 0)
 	for {
 		select {
@@ -81,9 +112,10 @@ func deleteLine(power chan bool, s *discordgo.Session) {
 				if waitDel[0].LimitUnix < nowUnix {
 					delMsg := waitDel[0]
 					waitDel = waitDel[1:]
-					err := s.ChannelMessageDelete(delMsg.ChannelId, delMsg.MessageId)
+					sess := delMsg.Session
+					err := sess.ChannelMessageDelete(delMsg.ChannelId, delMsg.MessageId)
 					if err != nil {
-						log.Println("MessageDeleteError:", err)
+						log.Printf("[%s]MessageDeleteError: %s\n", cfgDic[sess.Identify.Token].Name, err.Error())
 					}
 				}
 			}
@@ -95,6 +127,7 @@ func deleteLine(power chan bool, s *discordgo.Session) {
 // Callback
 
 func onVoiceStateUpdate(s *discordgo.Session, aft *discordgo.VoiceStateUpdate) {
+	token := s.Identify.Token
 	user := getUser(s, aft.UserID)
 	bef := aft.BeforeUpdate
 	validBef := bef != nil
@@ -110,31 +143,30 @@ func onVoiceStateUpdate(s *discordgo.Session, aft *discordgo.VoiceStateUpdate) {
 			// Move
 			befch := getChannel(s, bef.ChannelID)
 			aftch := getChannel(s, aft.ChannelID)
-			log.Printf("%s: %s -> %s", user.Username, befch.Name, aftch.Name)
-			for _, target := range cfg.Targets {
+			log.Printf("[%s]%s: %s -> %s", token, user.Username, befch.Name, aftch.Name)
+			for _, target := range cfgDic[token].Targets {
 				if befch.ParentID == target.Category || aftch.ParentID == target.Category {
 					// find target
-					sendNotify(s, target.TextChannel, makeNotifyMessage(user.Username, befch.Name, aftch.Name))
+					sendNotify(s, target.TextChannel, makeNotifyMessage(token, user.Username, befch.Name, aftch.Name))
 					return
 				}
 			}
 		} else {
 			befch := getChannel(s, bef.ChannelID)
-			for _, target := range cfg.Targets {
+			for _, target := range cfgDic[token].Targets {
 				if befch.ParentID == target.Category {
 					// find target
-					sendNotify(s, target.TextChannel, makeNotifyMessage(user.Username, befch.Name, ""))
+					sendNotify(s, target.TextChannel, makeNotifyMessage(token, user.Username, befch.Name, ""))
 					return
 				}
 			}
-			log.Printf("%s: Leave from %s", user.Username, befch.Name)
 		}
 	} else if validAft {
 		aftch := getChannel(s, aft.ChannelID)
-		for _, target := range cfg.Targets {
+		for _, target := range cfgDic[token].Targets {
 			if aftch.ParentID == target.Category {
 				// find target
-				sendNotify(s, target.TextChannel, makeNotifyMessage(user.Username, "", aftch.Name))
+				sendNotify(s, target.TextChannel, makeNotifyMessage(token, user.Username, "", aftch.Name))
 				return
 			}
 		}
@@ -146,7 +178,7 @@ func onVoiceStateUpdate(s *discordgo.Session, aft *discordgo.VoiceStateUpdate) {
 func getChannel(s *discordgo.Session, id string) *discordgo.Channel {
 	st, err := s.Channel(id)
 	if err != nil {
-		log.Fatal("Cant get channel:", err)
+		log.Fatalf("[%s]Can't get channel: %s\n", s.Identify.Token, err.Error())
 	}
 	return st
 }
@@ -154,35 +186,37 @@ func getChannel(s *discordgo.Session, id string) *discordgo.Channel {
 func getUser(s *discordgo.Session, id string) *discordgo.User {
 	us, err := s.User(id)
 	if err != nil {
-		log.Fatal("Cant get user:", err)
+		log.Fatalf("[%s]Can't get user: %s\n", s.Identify.Token, err.Error())
 	}
 	return us
 }
 
 func sendNotify(s *discordgo.Session, channelID string, msg string) {
-	log.Println("Send", channelID, msg)
+	token := s.Identify.Token
+	log.Printf("[%s]Send %s %s", cfgDic[token].Name, channelID, msg)
 	message, err := s.ChannelMessageSend(channelID, msg)
 
 	waitDel = append(waitDel, ReserveDelete{
+		Session:   s,
 		ChannelId: channelID,
 		MessageId: message.ID,
-		LimitUnix: time.Now().Unix() + cfg.DeleteTime,
+		LimitUnix: time.Now().Unix() + cfgDic[token].DeleteTime,
 	})
 
 	if err != nil {
-		log.Printf("MessageSendError[ChannelID:%s] %v¥n", channelID, err)
+		log.Printf("[%s]MessageSendError[ChannelID:%s] %v¥n", cfgDic[token].Name, channelID, err)
 	}
 }
 
-func makeNotifyMessage(user string, bef string, aft string) string {
+func makeNotifyMessage(token string, user string, bef string, aft string) string {
 	if bef == "" {
 		if aft == "" {
-			log.Fatal("Can't create message: both bef and aft is nothing")
+			log.Fatalf("[%s]Can't create message: both bef and aft is nothing\n", cfgDic[token].Name)
 		}
 		// Join notify
 		return strings.Replace(
 			strings.Replace(
-				cfg.Template.Join,
+				cfgDic[token].Join,
 				"{user}",
 				user,
 				-1,
@@ -192,11 +226,12 @@ func makeNotifyMessage(user string, bef string, aft string) string {
 			-1,
 		)
 	}
+
 	if aft == "" {
 		// Leave notify
 		return strings.Replace(
 			strings.Replace(
-				cfg.Template.Leave,
+				cfgDic[token].Leave,
 				"{user}",
 				user,
 				-1,
@@ -211,7 +246,7 @@ func makeNotifyMessage(user string, bef string, aft string) string {
 	return strings.Replace(
 		strings.Replace(
 			strings.Replace(
-				cfg.Template.Move,
+				cfgDic[token].Move,
 				"{user}",
 				user,
 				-1,

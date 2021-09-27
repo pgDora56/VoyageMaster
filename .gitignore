@@ -3,3 +3,4 @@ voyagemaster
 VoyageMaster.exe
 *.zip
 pub-*
+*.log
