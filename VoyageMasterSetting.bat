@@ -1,0 +1,1 @@
+VoyageMaster.exe setting
