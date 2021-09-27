@@ -1,9 +1,14 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
+	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -56,12 +61,17 @@ func main() {
 	if len(os.Args) > 1 {
 		if os.Args[1] == "setting" {
 			// setting tool
+			setting()
 		} else {
 			log.Printf("Unknown arguments: %v\n", os.Args[1:])
 		}
 		return
 	}
-	cfgs := getConfig()
+	cfgs, err := getConfig()
+	if err != nil {
+		log.Fatal(err)
+		return
+	}
 	for _, cfg := range cfgs {
 		go cfg.watch()
 		cfgDic["Bot "+cfg.Token] = cfg
@@ -70,6 +80,133 @@ func main() {
 
 	<-stopper
 }
+
+// Interactive setting tools
+func setting() {
+	log.Println("Move to setting mode")
+	scanner := bufio.NewScanner(os.Stdin)
+
+	var cfgs []Config
+	cfgs, err := getConfig()
+	if err == nil {
+		fmt.Println("The setting file is already there. Do you want to remake it? If not, it will be added to the existing settings.")
+		yorn := ""
+		for yorn != "yes" && yorn != "no" {
+			fmt.Print("yes(new settings)/no(add to the existing settings):")
+			scanner.Scan()
+			yorn = scanner.Text()
+		}
+		if yorn == "yes" {
+			cfgs = make([]Config, 0)
+		}
+	}
+
+	cont := "yes"
+	for cont == "yes" {
+		var cfg Config
+
+		// Bot-name
+		for cfg.Name == "" {
+			fmt.Print("Bot name:")
+			scanner.Scan()
+			cfg.Name = scanner.Text()
+		}
+
+		// Token
+		for cfg.Token == "" {
+			fmt.Print("Discord Bot Token:")
+			scanner.Scan()
+			cfg.Token = scanner.Text()
+		}
+
+		// Targets
+		cont = "yes"
+		for cont == "yes" {
+			var target Target
+			for target.Category == "" {
+				fmt.Print("Target category id(contain voice channels to be monitored):")
+				scanner.Scan()
+				target.Category = scanner.Text()
+			}
+			for target.TextChannel == "" {
+				fmt.Print("Text channel id(to send notifications to):")
+				scanner.Scan()
+				target.TextChannel = scanner.Text()
+			}
+			cfg.Targets = append(cfg.Targets, target)
+
+			cont = ""
+			fmt.Println("Do you want to add other targets? Please enter `yes` or `no`.")
+			for cont != "yes" && cont != "no" {
+				fmt.Print("yes/no:")
+				scanner.Scan()
+				cont = scanner.Text()
+			}
+		}
+
+		// Delete time
+		for cfg.DeleteTime <= 0 {
+			fmt.Print("Time to delete notification(natural number only(>0, integer)):")
+			scanner.Scan()
+			dt, err := strconv.Atoi(scanner.Text())
+			if err == nil {
+				cfg.DeleteTime = int64(dt)
+			}
+		}
+
+		// Join Message
+		fmt.Println("Please enter Join notification message template(`{user}`->username, `{channel}`->channel to join)")
+		for cfg.Join == "" {
+			fmt.Print("Join:")
+			scanner.Scan()
+			cfg.Join = scanner.Text()
+		}
+
+		// Move Message
+		fmt.Println("Please enter Move notification message template(`{user}`->username, `{before}`->channel to leave, `{after}`->channel to join)")
+		for cfg.Move == "" {
+			fmt.Print("Move:")
+			scanner.Scan()
+			cfg.Move = scanner.Text()
+		}
+
+		// Leave Message
+		fmt.Println("Please enter Leave notification message template(`{user}`->username, `{channel}`->channel to leave)")
+		for cfg.Leave == "" {
+			fmt.Print("Leave:")
+			scanner.Scan()
+			cfg.Leave = scanner.Text()
+		}
+
+		cfgs = append(cfgs, cfg)
+		cont = ""
+		fmt.Println("Do you want to add other setting? Please enter `yes` or `no`.")
+		for cont != "yes" && cont != "no" {
+			fmt.Print("yes/no:")
+			scanner.Scan()
+			cont = scanner.Text()
+		}
+	}
+
+	// Write file
+	buf := new(bytes.Buffer)
+	err = toml.NewEncoder(buf).Encode(struct {
+		Bot []Config `toml:"bot"`
+	}{
+		Bot: cfgs,
+	})
+
+	if err != nil {
+		log.Fatal("Toml encode error:", err)
+	}
+	err = ioutil.WriteFile("config.toml", buf.Bytes(), 0777)
+	if err != nil {
+		log.Fatal("File write error:", err)
+	}
+	log.Println("Create setting file: config.toml")
+}
+
+// Goroutines
 
 func (cfg Config) watch() {
 	disc, err := discordgo.New()
@@ -87,17 +224,6 @@ func (cfg Config) watch() {
 
 	log.Printf("[%s]Starting bot is successfully.", cfg.Name)
 	<-power
-}
-
-func getConfig() []Config {
-	var cfgs struct {
-		Bot []Config `toml:"bot"`
-	}
-	_, err := toml.DecodeFile("config.toml", &cfgs)
-	if err != nil {
-		log.Fatal(err)
-	}
-	return cfgs.Bot
 }
 
 func deleteLine(power chan bool) {
@@ -143,7 +269,7 @@ func onVoiceStateUpdate(s *discordgo.Session, aft *discordgo.VoiceStateUpdate) {
 			// Move
 			befch := getChannel(s, bef.ChannelID)
 			aftch := getChannel(s, aft.ChannelID)
-			log.Printf("[%s]%s: %s -> %s", token, user.Username, befch.Name, aftch.Name)
+			log.Printf("[%s]%s: %s -> %s", cfgDic[token].Name, user.Username, befch.Name, aftch.Name)
 			for _, target := range cfgDic[token].Targets {
 				if befch.ParentID == target.Category || aftch.ParentID == target.Category {
 					// find target
@@ -178,7 +304,7 @@ func onVoiceStateUpdate(s *discordgo.Session, aft *discordgo.VoiceStateUpdate) {
 func getChannel(s *discordgo.Session, id string) *discordgo.Channel {
 	st, err := s.Channel(id)
 	if err != nil {
-		log.Fatalf("[%s]Can't get channel: %s\n", s.Identify.Token, err.Error())
+		log.Fatalf("[%s]Can't get channel: %s\n", cfgDic[s.Identify.Token].Name, err.Error())
 	}
 	return st
 }
@@ -186,7 +312,7 @@ func getChannel(s *discordgo.Session, id string) *discordgo.Channel {
 func getUser(s *discordgo.Session, id string) *discordgo.User {
 	us, err := s.User(id)
 	if err != nil {
-		log.Fatalf("[%s]Can't get user: %s\n", s.Identify.Token, err.Error())
+		log.Fatalf("[%s]Can't get user: %s\n", cfgDic[s.Identify.Token].Name, err.Error())
 	}
 	return us
 }
@@ -259,4 +385,15 @@ func makeNotifyMessage(token string, user string, bef string, aft string) string
 		aft,
 		-1,
 	)
+}
+
+func getConfig() ([]Config, error) {
+	var cfgs struct {
+		Bot []Config `toml:"bot"`
+	}
+	_, err := toml.DecodeFile("config.toml", &cfgs)
+	if err != nil {
+		return nil, err
+	}
+	return cfgs.Bot, nil
 }
